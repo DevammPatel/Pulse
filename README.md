@@ -6,11 +6,6 @@ transforms them into analytics-ready gold tables, enforces automated data
 quality, and serves **live dashboards** — all runnable locally with a single
 `docker compose up`.
 
-> **Resume line this project backs up:** *"Built a real-time lakehouse
-> processing 10K+ events/sec with sub-second latency using Kafka, Spark
-> Structured Streaming, and Delta Lake, with automated data-quality checks via
-> Great Expectations, dbt transformations, and Airflow orchestration."*
-
 ---
 
 ## Architecture
