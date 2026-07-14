@@ -1,0 +1,14 @@
+# dbt-trino profile. Trino reads/writes the same Delta tables on MinIO.
+market_lakehouse:
+  target: dev
+  outputs:
+    dev:
+      type: trino
+      method: none
+      user: dbt
+      host: "{{ env_var('TRINO_HOST', 'trino') }}"
+      port: "{{ env_var('TRINO_PORT', '8080') | int }}"
+      database: delta          # Trino catalog
+      schema: analytics        # default target schema (created if missing)
+      threads: 4
+      http_scheme: http

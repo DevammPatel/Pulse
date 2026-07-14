@@ -1,0 +1,3 @@
+delta-spark==3.2.0
+great-expectations==0.18.19
+trino==0.328.0

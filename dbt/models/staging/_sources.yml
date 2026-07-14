@@ -1,0 +1,19 @@
+version: 2
+
+sources:
+  - name: market
+    database: delta          # Trino catalog
+    schema: market           # where the Spark-written Delta tables are registered
+    description: "Delta Lake tables produced by the Spark streaming job."
+    tables:
+      - name: silver_market_ticks
+        description: "Cleaned, deduped, typed market ticks."
+        columns:
+          - name: symbol
+            tests: [not_null]
+          - name: ltp
+            tests: [not_null]
+      - name: gold_ohlc_1min
+        description: "1-minute OHLCV candles per symbol."
+      - name: bronze_market_ticks
+        description: "Raw Kafka payloads (audit / replay)."

@@ -1,0 +1,62 @@
+{
+  "title": "Market Lakehouse — Live",
+  "uid": "market-live",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Ticks (last 5 min)",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "trino-datasource", "uid": "${DS_TRINO}" },
+      "targets": [
+        {
+          "rawSql": "SELECT count(*) AS ticks FROM delta.market.silver_market_ticks WHERE event_time > current_timestamp - interval '5' minute",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Distinct symbols trading",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "trino-datasource", "uid": "${DS_TRINO}" },
+      "targets": [
+        {
+          "rawSql": "SELECT count(distinct symbol) AS symbols FROM delta.market.silver_market_ticks WHERE event_time > current_timestamp - interval '5' minute",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Close price per minute (top symbols)",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 5 },
+      "datasource": { "type": "trino-datasource", "uid": "${DS_TRINO}" },
+      "targets": [
+        {
+          "rawSql": "SELECT window_start AS time, symbol AS metric, close AS value FROM delta.market.gold_ohlc_1min WHERE window_start > current_timestamp - interval '1' hour AND symbol IN ('RELIANCE','TCS','HDFCBANK','INFY','ICICIBANK') ORDER BY window_start",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "barchart",
+      "title": "Turnover by sector (last minute)",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 15 },
+      "datasource": { "type": "trino-datasource", "uid": "${DS_TRINO}" },
+      "targets": [
+        {
+          "rawSql": "SELECT sector, sum(turnover) AS turnover FROM delta.market.gold_ohlc_1min WHERE window_start > current_timestamp - interval '2' minute GROUP BY sector ORDER BY turnover DESC",
+          "format": "table"
+        }
+      ]
+    }
+  ]
+}

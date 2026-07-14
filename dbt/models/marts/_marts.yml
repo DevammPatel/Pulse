@@ -1,0 +1,33 @@
+version: 2
+
+models:
+  - name: mart_symbol_daily
+    description: "Daily OHLCV rollup per symbol."
+    columns:
+      - name: symbol
+        tests: [not_null]
+      - name: event_date
+        tests: [not_null]
+      - name: day_close
+        tests:
+          - not_null
+      - name: day_volume
+        tests:
+          - dbt_utils.accepted_range:
+              min_value: 0
+              inclusive: true
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [event_date, symbol]
+
+  - name: mart_sector_performance
+    description: "Latest-day sector turnover, breadth, and average change."
+    columns:
+      - name: sector
+        tests: [not_null]
+
+  - name: mart_symbol_volatility
+    description: "Intraday volatility and range metrics per symbol."
+    columns:
+      - name: symbol
+        tests: [not_null]
