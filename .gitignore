@@ -1,0 +1,9 @@
+.env
+airflow/logs/*
+!airflow/logs/.gitkeep
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+**/__pycache__/
+*.pyc
+.DS_Store

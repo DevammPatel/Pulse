@@ -1,0 +1,326 @@
+# ============================================================================
+# Real-Time Streaming Lakehouse — NSE/BSE Market Data
+# Kafka -> Spark Structured Streaming -> Delta Lake (MinIO) -> dbt/Trino -> BI
+# ----------------------------------------------------------------------------
+# Bring the whole stack up with:  make up   (or: docker compose up -d)
+# ============================================================================
+
+x-airflow-common: &airflow-common
+  build:
+    context: ./airflow
+    dockerfile: Dockerfile
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    AIRFLOW__CORE__FERNET_KEY: "46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho="
+    PYTHONPATH: /opt/airflow
+    TRINO_HOST: trino
+    TRINO_PORT: "8080"
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/plugins:/opt/airflow/plugins
+    - ./airflow/logs:/opt/airflow/logs
+    - ./dbt:/opt/airflow/dbt
+    - ./quality:/opt/airflow/quality
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  # ---------------------------------------------------------------------------
+  # Kafka (KRaft mode — no ZooKeeper)
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    hostname: kafka
+    container_name: kafka
+    ports:
+      - "9092:9092"    # external listener (host)
+      - "29092:29092"  # internal listener (docker network)
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_LISTENERS: "PLAINTEXT://kafka:29092,CONTROLLER://kafka:9093,EXTERNAL://0.0.0.0:9092"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:29092,EXTERNAL://localhost:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 6
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:29092", "--list"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8085:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      DYNAMIC_CONFIG_ENABLED: "true"
+
+  # ---------------------------------------------------------------------------
+  # MinIO — S3-compatible object store (the lakehouse storage layer)
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # web console
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # One-shot: create buckets used by the lakehouse
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin};
+      mc mb -p local/lakehouse;
+      mc mb -p local/warehouse;
+      mc anonymous set public local/lakehouse;
+      echo 'MinIO buckets ready';
+      exit 0;
+      "
+
+  # ---------------------------------------------------------------------------
+  # Hive Metastore — table catalog so Trino/dbt can read Delta tables
+  # ---------------------------------------------------------------------------
+  hive-metastore:
+    image: bitsondatadev/hive-metastore:latest
+    container_name: hive-metastore
+    depends_on:
+      - hive-metastore-postgres
+      - minio
+    ports:
+      - "9083:9083"
+    environment:
+      METASTORE_DB_HOSTNAME: hive-metastore-postgres
+    volumes:
+      - ./trino/metastore-site.xml:/opt/apache-hive-metastore-3.0.0-bin/conf/metastore-site.xml:ro
+
+  hive-metastore-postgres:
+    image: postgres:15
+    container_name: hive-metastore-postgres
+    environment:
+      POSTGRES_USER: hive
+      POSTGRES_PASSWORD: hive
+      POSTGRES_DB: metastore
+    volumes:
+      - hive-pg-data:/var/lib/postgresql/data
+
+  # ---------------------------------------------------------------------------
+  # Trino — SQL query engine over Delta tables (used by dbt + BI tools)
+  # ---------------------------------------------------------------------------
+  trino:
+    image: trinodb/trino:444
+    container_name: trino
+    ports:
+      - "8080:8080"
+    depends_on:
+      - hive-metastore
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog:ro
+
+  # ---------------------------------------------------------------------------
+  # Spark — master + worker + the streaming job
+  # ---------------------------------------------------------------------------
+  spark-master:
+    build:
+      context: ./streaming
+      dockerfile: Dockerfile
+    container_name: spark-master
+    command: ["/opt/bitnami/spark/sbin/start-master.sh"]
+    environment:
+      SPARK_MODE: master
+      SPARK_MASTER_HOST: spark-master
+    ports:
+      - "7077:7077"
+      - "8090:8080"   # Spark master UI
+    volumes:
+      - ./streaming/jobs:/opt/jobs
+      - ./quality:/opt/quality
+
+  spark-worker:
+    build:
+      context: ./streaming
+      dockerfile: Dockerfile
+    container_name: spark-worker
+    command: ["/opt/bitnami/spark/sbin/start-worker.sh", "spark://spark-master:7077"]
+    environment:
+      SPARK_MODE: worker
+      SPARK_WORKER_CORES: 4
+      SPARK_WORKER_MEMORY: 4G
+    depends_on:
+      - spark-master
+    volumes:
+      - ./streaming/jobs:/opt/jobs
+      - ./quality:/opt/quality
+
+  # Long-running Structured Streaming job: Kafka -> Delta (bronze + silver)
+  spark-streaming:
+    build:
+      context: ./streaming
+      dockerfile: Dockerfile
+    container_name: spark-streaming
+    depends_on:
+      kafka:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      spark-master:
+        condition: service_started
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - ./streaming/jobs:/opt/jobs
+      - ./quality:/opt/quality
+    command: >
+      /opt/bitnami/spark/bin/spark-submit
+      --master spark://spark-master:7077
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,io.delta:delta-spark_2.12:3.2.0,org.apache.hadoop:hadoop-aws:3.3.4
+      --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
+      --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog
+      /opt/jobs/spark_streaming_job.py
+
+  # ---------------------------------------------------------------------------
+  # Market data producer -> Kafka
+  # ---------------------------------------------------------------------------
+  producer:
+    build:
+      context: ./ingestion
+      dockerfile: Dockerfile
+    container_name: producer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+      KAFKA_TOPIC: market.ticks
+      TARGET_EPS: ${TARGET_EPS:-10000}
+      USE_LIVE_FEED: ${USE_LIVE_FEED:-true}
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Postgres — Airflow + Superset metadata
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Airflow — batch orchestration (dbt + data quality + compaction)
+  # ---------------------------------------------------------------------------
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create --username admin --password admin \
+          --firstname admin --lastname admin --role Admin --email admin@example.com || true
+    restart: on-failure
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "8081:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Superset — live BI dashboards over Trino
+  # ---------------------------------------------------------------------------
+  superset:
+    image: apache/superset:3.1.0
+    container_name: superset
+    ports:
+      - "8088:8088"
+    environment:
+      SUPERSET_SECRET_KEY: "a-long-random-secret-key-change-me"
+    depends_on:
+      - trino
+    volumes:
+      - ./dashboards/superset/superset_init.sh:/app/superset_init.sh:ro
+    command: ["/bin/sh", "-c", "chmod +x /app/superset_init.sh && /app/superset_init.sh"]
+
+  # ---------------------------------------------------------------------------
+  # Grafana — real-time operational dashboards over Trino
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_INSTALL_PLUGINS: trino-datasource
+    volumes:
+      - ./dashboards/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - trino
+
+volumes:
+  minio-data:
+  postgres-data:
+  hive-pg-data:
